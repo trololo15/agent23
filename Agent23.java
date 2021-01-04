@@ -20,15 +20,15 @@ import org.ujmp.core.DenseMatrix;
 import org.ujmp.core.Matrix;
 
 import java.util.*;
-import java.util.function.Supplier;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 public class Agent23 extends AbstractNegotiationParty {
 
+    private static boolean LOG_ENABLED = true;
+
     private List<Bid> bidOrder = null;
     private List<Issue> issues = null;
-    private Map<Issue, Map<Value, Integer>> issueValueLabel = new HashMap<>();
+    private Map<Issue, Map<Value, Integer>> issueValueLabel;
     private Integer regFeatureDim = 0;
     private Integer possibleBidsCount = 1;
     private Matrix coefficient;
@@ -43,16 +43,21 @@ public class Agent23 extends AbstractNegotiationParty {
     private double predMaxUtility;
     private double predMinUtility;
 
-    private double estimatedNP;
-    private boolean didGetNP = false;
+    private Bid lastReceivedBid;
+    private double maxOpponentToAgentUtility;
+    private boolean initialTimePass = false;
+    private boolean maxOpponentToAgentBidAvailable = false;
+    private double startTime;
+    private double estimatedNashPoint = 0.8;
 
     @Override
     public void init(NegotiationInfo info) {
         super.init(info);
 
         if (hasPreferenceUncertainty()) {
-
             issues = userModel.getDomain().getIssues();
+            issueValueLabel = new HashMap<>();
+
             for (Issue issue: issues) {
                 IssueDiscrete issueDiscrete = (IssueDiscrete) issue;
                 List<ValueDiscrete> issueValues = issueDiscrete.getValues();
@@ -76,11 +81,13 @@ public class Agent23 extends AbstractNegotiationParty {
             // Prepare for training y
             realMaxUtility = bidRanking.getHighUtility();
             realMinUtility = bidRanking.getLowUtility();
+
             double[] regressionValue = new double[bidOrder.size()];
             regressionValue[0] = realMinUtility;
             regressionValue[regressionValue.length - 1] = realMaxUtility;
             for (int i = 1; i < regressionValue.length - 1; ++i)
                 regressionValue[i] = regressionValue[i - 1] + (realMaxUtility - realMinUtility) / (bidOrder.size() - 1);
+
 
             // Ridge Regression
             Matrix X = DenseMatrix.Factory.importFromArray(oneHotEncodedBids);
@@ -121,140 +128,161 @@ public class Agent23 extends AbstractNegotiationParty {
         if (lastOffer == null)
             return new Offer(getPartyId(), maxUtilityBid);
 
-        if (t >= 0.3 && t < 0.9) {
-//			didGetNP = true;
-            Bid maxBid = maxUtilityBid;
-            Bid minBid = minUtilityBid;
-            double oppoMaxU = opponentModel.getUtility(lastOffer);
-            double meMinU = getUtility(minBid);
-            double meMaxU = getUtility(maxBid);
-            double maxR = (oppoMaxU - meMinU)/(meMaxU - meMinU);
-            estimatedNP = (1-maxR)/1.68 + maxR;
-            log("estimatedNP: " + estimatedNP);
-        }
-
         double lastOfferUtility = getUtility(lastOffer);
 
+        if (!maxOpponentToAgentBidAvailable) getMaxOpponentToAgent(t, 20.0 / 200.0, lastOfferUtility);
+        lastReceivedBid = lastOffer;
+
+        // 60轮之前不考虑opponent model
         if (t < 0.3) {
+            log("Round " + timeline.getCurrentTime() + "\tTime " + t + "\tEstimatedUtility " + lastOfferUtility);
             double utilityMinusThresh = lastOfferUtility - threshold;
+            // 如果对方给我们的utility大于等于threshold，则直接Accept
             if (utilityMinusThresh >= 0) {
                 log("Time: " + t + "\tAccept Bid: " + lastOffer);
                 return new Accept(getPartyId(), lastOffer);
             }
-            if (utilityMinusThresh >= 0.1)
-                return new Offer(getPartyId(), generateBidAroundUtility((lastOfferUtility + threshold) / 2, 0.03));
-            if (utilityMinusThresh >= 0.25)
-                return new Offer(getPartyId(), generateBidAroundUtility((lastOfferUtility + utilityMinusThresh * (10./9 * utilityMinusThresh + 7./18)), 0.02));
-            return new Offer(getPartyId(), maxUtilityBid);
+            // 如果对方给我们的utility非常接近threshold，则选择中间值附近的bid，如果选不出就Accept
+            if (utilityMinusThresh >= -0.2) {
+                double desiredUtility = (lastOfferUtility + 1) / 2;
+                Bid selectedBid = generateBidAroundUtility(desiredUtility, -utilityMinusThresh * 0.3, lastOfferUtility, 1);
+                if (selectedBid == null) {
+                    log("Time: " + t + "\tAccept Bid: " + lastOffer);
+                    return new Accept(getPartyId(), lastOffer);
+                }
+                return new Offer(getPartyId(), selectedBid);
+            }
+
+            // 如果对方给我们的utility较低时，生成较高utility的bid
+            double desiredUtility = threshold - t * 0.3;
+            Bid selectedBid = generateBidAroundUtility(desiredUtility, 0.02, 0.85, 1);
+            if (selectedBid == null)
+                return new Offer(getPartyId(), maxUtilityBid);
+            return new Offer(getPartyId(), selectedBid);
         }
 
+        // 60轮之后尽量给对手高的utility，同时慢慢降低自己的utility
         double opponentUtility = opponentModel.getUtility(lastOffer);
-        if (lastOfferUtility >= threshold) {
-            if (t < 0.95 && opponentUtility - lastOfferUtility > 0.2)
-                return new Offer(getPartyId(), generateBidAgainstOpponent(opponentUtility, lastOfferUtility));
+        log("Round " + timeline.getCurrentTime() + "\tTime " + t + "\tEstimatedUtility " + lastOfferUtility + "\tOpponent Utility " + opponentUtility);
+
+        if (lastOfferUtility >= threshold && opponentUtility >= threshold - 0.2) {
             log("Time: " + t + "\tAccept Bid: " + lastOffer);
             return new Accept(getPartyId(), lastOffer);
         }
-        return new Offer(getPartyId(), generateBidAroundThreshold());
+        return new Offer(getPartyId(), generateBidMaximumOpponentUtility(threshold, 0.02));
+    }
 
+    private void getMaxOpponentToAgent(double time, double timeLast, double bidUtility) {
+        if (bidUtility > maxOpponentToAgentUtility)
+            maxOpponentToAgentUtility = bidUtility;
+
+        if (initialTimePass) {
+            if (time - startTime > timeLast) {
+                double maxOpponentToAgentBidRatio = (maxOpponentToAgentUtility - realMinUtility) / (realMaxUtility - realMinUtility);
+                estimatedNashPoint = (1 - maxOpponentToAgentBidRatio) / 1.7 + maxOpponentToAgentBidRatio; // 1.414 是圆，2是直线
+                maxOpponentToAgentBidAvailable = true;
+                log("Estimated Nash Point: " + estimatedNashPoint);
+            }
+        } else {
+            if (lastReceivedBid != lastOffer) {
+                initialTimePass = true;
+                startTime = time;
+            }
+        }
     }
 
     private void updateThreshold(double t) {
-        if (t < 0.1) {
-            threshold = 0.9;
-        }else if (t < 0.3) {
-            threshold =  0.9 - 0.5 * (t - 0.01);
-        }else if (t < 0.4) {
-            double p = 0.3 * (1 - estimatedNP) + estimatedNP;
-            threshold =  0.9
-                    - (0.9 - p) / (0.5 - 0.2) * (t - 0.2);
-        }else if (t < 0.8) {
-            double p1 = 0.3 * (1 - this.estimatedNP)
-                    + this.estimatedNP;
-            double p2 = 0.15 * (1 - this.estimatedNP)
-                    + this.estimatedNP;
-            this.threshold = p1 - (p1 - p2) / (0.9 - 0.5) * (t - 0.5);
-        }else if (t < 0.95) {
-            threshold = 0.86 - 0.35 * (t - 0.6);
-        }else {
-            threshold = 0.748 - 0.5 * (t - 0.92);
+        if (t < 0.1)
+            threshold = 0.95;
+        else if (t < 0.3)
+            threshold = 0.95 - (t - 0.1) * 0.25;
+        else if (t < 0.5) {
+            double p1 = 0.3 * (1 - estimatedNashPoint) + estimatedNashPoint;
+            threshold = 0.9 - (0.9 - p1) / (0.5 - 0.2) * (t - 0.2);
         }
+        else if (t < 0.9) {
+            double p1 = 0.3 * (1 - estimatedNashPoint) + estimatedNashPoint;
+            double p2 = 0.15 * (1 - estimatedNashPoint) + estimatedNashPoint;
+            threshold = p1 - (p1 - p2) / (0.9 - 0.5) * (t - 0.5);
+        }
+        else if (t < 0.95) {
+            double p2 = 0.15 * (1 - estimatedNashPoint) + estimatedNashPoint;
+            double p3 = 0.05 * (1 - estimatedNashPoint) + estimatedNashPoint;
+            threshold = p2 - (p2 - p3) / (0.95 - 0.9) * (t - 0.9);
+        }
+        else if (t < 0.99) {
+            double p3 = 0.05 * (1 - estimatedNashPoint) + estimatedNashPoint;
+            double p4 = -0.35 * (1 - estimatedNashPoint) + estimatedNashPoint;
+            threshold = p3 - (p3 - p4) / (0.99 - 0.95) * (t - 0.95);
+        }
+        else
+            threshold = -0.4 * (1 - estimatedNashPoint) + estimatedNashPoint;
     }
 
-    private Bid generateBidAroundUtility(double utility, double tolerance) {
-        Bid randomBid, selectedBid;
+    /**
+     * 生成目标值desiredUtility附近的bid
+     * @param desiredUtility 想要得到的bid的utility值
+     * @param optimalRange bid的最佳utility范围(desiredUtility-optimalRange, desiredUtility+optimalRange)
+     * @param minUtility bid的utility最低可能值
+     * @param maxUtility bid的utility最高可能值
+     * @return 如果找到bid则返回bid，否则返回null
+     */
+    private Bid generateBidAroundUtility(double desiredUtility, double optimalRange, double minUtility, double maxUtility) {
+        Bid randomBid, backupBid1 = null, backupBid2 = null;
         double randomBidUtility;
-        Map<Bid, Double> bidsUtilities = new HashMap<>();
-        for (int i = 0; i < 2 * possibleBidsCount; i++) {
+
+        for (int i = 0; i < 2 * possibleBidsCount; ++i) {
             randomBid = generateRandomBid();
             randomBidUtility = getUtility(randomBid);
-            bidsUtilities.put(randomBid, Math.abs(randomBidUtility - utility));
-        }
-        List<Map.Entry<Bid, Double>> bidsUtilitiesList = new ArrayList<>(bidsUtilities.entrySet());
-        bidsUtilitiesList.sort(Comparator.comparingDouble(Map.Entry::getValue));
-        selectedBid = bidsUtilitiesList.get(0).getKey();
-        if (bidsUtilitiesList.get(0).getValue() > tolerance)
-            return maxUtilityBid;
-        return  selectedBid;
-    }
-
-    private Bid generateBidAgainstOpponent(double opponentUtility, double agentUtility) {
-        Bid randomBid;
-        double distance = opponentUtility - agentUtility;
-        double randomBidAgentUtility, randomBidOpponentUtility;
-        for (int i = 0; i < 2 * possibleBidsCount; i++) {
-            randomBid = generateRandomBid();
-            randomBidAgentUtility = getUtility(randomBid);
-            randomBidOpponentUtility = opponentModel.getUtility(randomBid);
-            if (opponentUtility - randomBidAgentUtility < distance &&
-                    opponentUtility - randomBidAgentUtility > 0 &&
-                    randomBidOpponentUtility - agentUtility < distance &&
-                    randomBidOpponentUtility - agentUtility >= 0)
+            // 如果找到utility附近的bid，则直接返回
+            if (Math.abs(randomBidUtility - desiredUtility) < optimalRange)
                 return randomBid;
+            // 如果没有找到，优先选择大于utility且小于maxUtility的最小bid
+            if (randomBidUtility > desiredUtility && randomBidUtility < maxUtility) {
+                backupBid1 = randomBid;
+                maxUtility = randomBidUtility;
+            }
+            // 如果还是没有找到，则选择小于utility且大于minUtility的最大bid
+            else if (backupBid1 == null && randomBidUtility < desiredUtility && randomBidUtility > minUtility) {
+                backupBid2 = randomBid;
+                minUtility = randomBidUtility;
+            }
         }
-        return maxUtilityBid;
+        if (backupBid1 != null)
+            return backupBid1;
+        return backupBid2;
     }
 
-    private Bid generateBidAroundThreshold() {
-        double t = timeline.getTime();
-
-        Bid randomBid, finalBid = null;
-        double agentUtility, opponentUtility, metric;
-        double maximumMetric = 0;
-
-        if (t < 0.3) {
-            Map<Bid, Double> bidsUtilities = new HashMap<>();
-            int randomCount = possibleBidsCount > 200 ? 200: possibleBidsCount;
-            for (int i = 0; i < randomCount; i++) {
-                randomBid = generateRandomBid();
-                agentUtility = getUtility(randomBid);
-                bidsUtilities.put(randomBid, agentUtility);
-            }
-            List<Map.Entry<Bid, Double>> entries = new ArrayList<>(bidsUtilities.entrySet());
-            entries.sort(Comparator.comparingDouble(Map.Entry::getValue));
-            Random random = new Random();
-            int randomIndex;
-            if (t < 0.1)
-                randomIndex = random.nextInt((int) (0.3 * randomCount)) + (int) (0.3 * randomCount);
-            else
-                randomIndex = random.nextInt((int) (0.5 * randomCount)) + (int) (0.3 * randomCount);
-            return entries.get(randomIndex).getKey();
-
-        }
-
-        for (int i = 0; i < 2 * possibleBidsCount; i++) {
+    /**
+     * 生成目标值desiredUtility附近，且对手utility最高的bid
+     * @param desiredUtility 想要得到的bid的utility值
+     * @param optimalRange bid的最佳utility范围(desiredUtility-optimalRange, desiredUtility+optimalRange)
+     * @return 如果找到bid则返回bid，否则扩大optimalRange范围直到找到为止
+     */
+    private Bid generateBidMaximumOpponentUtility(double desiredUtility, double optimalRange) {
+        Bid randomBid;
+        double agentUtility, opponentUtility, distance;
+        Map<Bid, Double> bidUtilityMap = new HashMap<>();
+        for (int i = 0; i < 2 * possibleBidsCount; ++i) {
             randomBid = generateRandomBid();
             agentUtility = getUtility(randomBid);
-            opponentUtility = opponentModel.getUtility(randomBid);
-            metric = agentUtility * opponentUtility + t * opponentUtility + 0.85 * agentUtility;
-            if (metric > maximumMetric) {
-                finalBid = randomBid;
-                maximumMetric = metric;
+            distance = Math.abs(agentUtility - desiredUtility);
+            if (distance <= optimalRange) {
+                opponentUtility = opponentModel.getUtility(randomBid);
+                bidUtilityMap.put(randomBid, opponentUtility);
             }
         }
-        if (finalBid == null)
-            finalBid = maxUtilityBid;
-        return finalBid;
+        if (bidUtilityMap.size() == 0)
+            return generateBidMaximumOpponentUtility(desiredUtility, optimalRange + 0.01);
+
+        List<Map.Entry<Bid, Double>> bidUtilityList = new ArrayList<>(bidUtilityMap.entrySet());
+        bidUtilityList.sort(Comparator.comparingDouble(Map.Entry::getValue));
+        RandomCollection<Bid> bidRandomCollection = new RandomCollection<>();
+        for (int i = 0; i < bidUtilityList.size() * 0.1; ++i) {
+            Map.Entry<Bid, Double> entry = bidUtilityList.get(bidUtilityList.size() - i - 1);
+            bidRandomCollection.add(entry.getValue(), entry.getKey());
+        }
+        return bidRandomCollection.next();
     }
 
     @Override
@@ -276,7 +304,8 @@ public class Agent23 extends AbstractNegotiationParty {
     }
 
     private void log(Object msg) {
-        System.out.println(msg);
+        if (LOG_ENABLED)
+            System.out.println(msg);
     }
 
     // convert bids to labels
@@ -311,6 +340,32 @@ public class Agent23 extends AbstractNegotiationParty {
         return oneHotArray;
     }
 
+    public class RandomCollection<E> {
+        private final NavigableMap<Double, E> map = new TreeMap<>();
+        private final Random random;
+        private double total = 0;
+
+        public RandomCollection() {
+            this(new Random());
+        }
+
+        RandomCollection(Random random) {
+            this.random = random;
+        }
+
+        public RandomCollection<E> add(double weight, E result) {
+            if (weight <= 0) return this;
+            total += weight;
+            map.put(total, result);
+            return this;
+        }
+
+        public E next() {
+            double value = random.nextDouble() * total;
+            return map.higherEntry(value).getValue();
+        }
+    }
+
     private class RegressionUtilitySpace extends CustomUtilitySpace {
 
         RegressionUtilitySpace(Domain dom) {
@@ -328,8 +383,8 @@ public class Agent23 extends AbstractNegotiationParty {
             double utility = X.mtimes(coefficient).toDoubleArray()[0][0];
             utility = k * utility + b;
             if (utility > realMaxUtility)
-                utility = realMaxUtility - 0.001;
-            else if (utility < realMinUtility + 0.001)
+                utility = realMaxUtility - new Random().nextDouble() * 0.1;
+            else if (utility < realMinUtility + new Random().nextDouble() * 0.1)
                 utility = realMinUtility;
             return utility;
         }
