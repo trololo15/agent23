@@ -33,20 +33,23 @@ public class Agent23 extends AbstractNegotiationParty {
     private Integer possibleBidsCount = 1;
     private Matrix coefficient;
     private OpponentModel opponentModel;
-	private double threshold;
-	private Bid lastOffer;
+    private double threshold;
+    private Bid lastOffer;
 
-	private Bid maxUtilityBid;
-	private Bid minUtilityBid;
-	private double realMaxUtility;
-	private double realMinUtility;
-	private double predMaxUtility;
-	private double predMinUtility;
+    private Bid maxUtilityBid;
+    private Bid minUtilityBid;
+    private double realMaxUtility;
+    private double realMinUtility;
+    private double predMaxUtility;
+    private double predMinUtility;
+
+    private double estimatedNP;
+    private boolean didGetNP = false;
 
     @Override
     public void init(NegotiationInfo info) {
         super.init(info);
-        
+
         if (hasPreferenceUncertainty()) {
 
             issues = userModel.getDomain().getIssues();
@@ -112,11 +115,23 @@ public class Agent23 extends AbstractNegotiationParty {
 
     @Override
     public Action chooseAction(List<Class<? extends Action>> possibleActions) {
-    	double t = timeline.getTime();
-		updateThreshold(t);
+        double t = timeline.getTime();
+        updateThreshold(t);
 
-		if (lastOffer == null)
-		    return new Offer(getPartyId(), maxUtilityBid);
+        if (lastOffer == null)
+            return new Offer(getPartyId(), maxUtilityBid);
+
+        if (t >= 0.3 && t < 0.9) {
+//			didGetNP = true;
+            Bid maxBid = maxUtilityBid;
+            Bid minBid = minUtilityBid;
+            double oppoMaxU = opponentModel.getUtility(lastOffer);
+            double meMinU = getUtility(minBid);
+            double meMaxU = getUtility(maxBid);
+            double maxR = (oppoMaxU - meMinU)/(meMaxU - meMinU);
+            estimatedNP = (1-maxR)/1.68 + maxR;
+            log("estimatedNP: " + estimatedNP);
+        }
 
         double lastOfferUtility = getUtility(lastOffer);
 
@@ -134,8 +149,8 @@ public class Agent23 extends AbstractNegotiationParty {
         }
 
         double opponentUtility = opponentModel.getUtility(lastOffer);
-        if (lastOfferUtility >= threshold && opponentUtility >= threshold - 0.1) {
-            if (t < 0.95 && opponentUtility - lastOfferUtility > 0.04)
+        if (lastOfferUtility >= threshold) {
+            if (t < 0.95 && opponentUtility - lastOfferUtility > 0.2)
                 return new Offer(getPartyId(), generateBidAgainstOpponent(opponentUtility, lastOfferUtility));
             log("Time: " + t + "\tAccept Bid: " + lastOffer);
             return new Accept(getPartyId(), lastOffer);
@@ -143,19 +158,30 @@ public class Agent23 extends AbstractNegotiationParty {
         return new Offer(getPartyId(), generateBidAroundThreshold());
 
     }
-    
-    private void updateThreshold(double t) {
-		if (t < 0.3)
-			threshold = 0.95;
-		else if (t < 0.6)
-		    threshold = - t * t + 0.6 * t + 0.86;
-		else if (t < 0.92)
-			threshold = 0.86 - 0.1875 * (t - 0.6);
-		else
-			threshold = 0.8 - 0.5 * (t - 0.92);
-	}
 
-	private Bid generateBidAroundUtility(double utility, double tolerance) {
+    private void updateThreshold(double t) {
+        if (t < 0.1) {
+            threshold = 0.9;
+        }else if (t < 0.3) {
+            threshold =  0.9 - 0.5 * (t - 0.01);
+        }else if (t < 0.4) {
+            double p = 0.3 * (1 - estimatedNP) + estimatedNP;
+            threshold =  0.9
+                    - (0.9 - p) / (0.5 - 0.2) * (t - 0.2);
+        }else if (t < 0.8) {
+            double p1 = 0.3 * (1 - this.estimatedNP)
+                    + this.estimatedNP;
+            double p2 = 0.15 * (1 - this.estimatedNP)
+                    + this.estimatedNP;
+            this.threshold = p1 - (p1 - p2) / (0.9 - 0.5) * (t - 0.5);
+        }else if (t < 0.95) {
+            threshold = 0.86 - 0.35 * (t - 0.6);
+        }else {
+            threshold = 0.748 - 0.5 * (t - 0.92);
+        }
+    }
+
+    private Bid generateBidAroundUtility(double utility, double tolerance) {
         Bid randomBid, selectedBid;
         double randomBidUtility;
         Map<Bid, Double> bidsUtilities = new HashMap<>();
@@ -172,7 +198,7 @@ public class Agent23 extends AbstractNegotiationParty {
         return  selectedBid;
     }
 
-	private Bid generateBidAgainstOpponent(double opponentUtility, double agentUtility) {
+    private Bid generateBidAgainstOpponent(double opponentUtility, double agentUtility) {
         Bid randomBid;
         double distance = opponentUtility - agentUtility;
         double randomBidAgentUtility, randomBidOpponentUtility;
@@ -189,16 +215,16 @@ public class Agent23 extends AbstractNegotiationParty {
         return maxUtilityBid;
     }
 
-	private Bid generateBidAroundThreshold() {
-		double t = timeline.getTime();
+    private Bid generateBidAroundThreshold() {
+        double t = timeline.getTime();
 
         Bid randomBid, finalBid = null;
         double agentUtility, opponentUtility, metric;
         double maximumMetric = 0;
 
-		if (t < 0.3) {
-		    Map<Bid, Double> bidsUtilities = new HashMap<>();
-		    int randomCount = possibleBidsCount > 200 ? 200: possibleBidsCount;
+        if (t < 0.3) {
+            Map<Bid, Double> bidsUtilities = new HashMap<>();
+            int randomCount = possibleBidsCount > 200 ? 200: possibleBidsCount;
             for (int i = 0; i < randomCount; i++) {
                 randomBid = generateRandomBid();
                 agentUtility = getUtility(randomBid);
@@ -228,8 +254,8 @@ public class Agent23 extends AbstractNegotiationParty {
         }
         if (finalBid == null)
             finalBid = maxUtilityBid;
-		return finalBid;
-	}
+        return finalBid;
+    }
 
     @Override
     public void receiveMessage(AgentID sender, Action act) {
